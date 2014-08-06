@@ -765,6 +765,126 @@ static void android_alarm_clear(void)
 cleanup:
     return;
 }
+/* ------------------------------------------------------------------------- *
+ * circumventing RTC not working as expected
+ * ------------------------------------------------------------------------- */
+
+/** Flag for: assume RTC_SET_TIME works
+ *
+ * RTC time of day is not used for syncing system time
+ * while this is set to false.
+ *
+ * FIXME: All of this is just a quick hack ...
+ */
+static bool rtc_set_time_works = true;
+
+/** Delta between rtc and system time
+ *
+ * Access only via rtc_get/set/update_error() functions
+ */
+static time_t rtc_error = 0;
+
+/** Persistent storage for rtc_error */
+#define RTC_ERROR_FILE "/var/tmp/rtc-delta"
+
+static time_t rtc_get_error(void)
+{
+    static bool load_attempted = false;
+
+    int fd = -1;
+
+    if( load_attempted )
+        goto cleanup;
+
+    load_attempted = true;
+
+    if( (fd = open(RTC_ERROR_FILE, O_RDONLY)) == -1 ) {
+        if( errno != ENOENT )
+            dsme_log(LOG_ERR, PFIX"%s: %s: %m", RTC_ERROR_FILE, "open");
+        goto cleanup;
+    }
+
+    char tmp[32];
+    int len = read(fd, tmp, sizeof tmp - 1);
+    if( len < 0 ) {
+        dsme_log(LOG_ERR, PFIX"%s: %s: %m", RTC_ERROR_FILE, "read");
+        goto cleanup;
+    }
+
+    tmp[len] = 0;
+
+    rtc_error = strtol(tmp, 0, 0);
+    rtc_set_time_works = (rtc_error == 0);
+
+cleanup:
+
+    if( fd != -1 ) close(fd);
+
+    dsme_log(LOG_ERR, PFIX"rtc error is %ld", (long)rtc_error);
+
+    return rtc_error;
+}
+
+static void rtc_set_error(time_t t_err)
+{
+    int fd = -1;
+
+    if( abs(rtc_error - t_err) <= 2 )
+        goto cleanup;
+
+    rtc_error = t_err;
+
+    rtc_set_time_works = (rtc_error == 0);
+
+    dsme_log(LOG_ERR, PFIX"rtc error to %ld", (long)rtc_error);
+
+    if( (fd = open(RTC_ERROR_FILE, O_WRONLY|O_CREAT|O_TRUNC, 0644)) == -1 ) {
+        dsme_log(LOG_ERR, PFIX"%s: %s: %m", RTC_ERROR_FILE, "open");
+        goto cleanup;
+    }
+
+    char tmp[32];
+    int len = snprintf(tmp, sizeof tmp, "%ld\n", (long)t_err);
+
+    if( len > 0 && write(fd, tmp, len) == -1 ) {
+        dsme_log(LOG_ERR, PFIX"%s: %s: %m", RTC_ERROR_FILE, "write");
+        goto cleanup;
+    }
+
+cleanup:
+
+    if( fd != -1 ) close(fd);
+}
+
+static time_t rtc_get_time_tm(struct tm *tm);
+
+static time_t rtc_update_error(void)
+{
+    struct tm tm;
+
+    if( rtc_fd == -1 ) {
+        // FIXME: ensure that this is not called while rtc dev is not open
+        return 0;
+    }
+
+    time_t t_rtc = rtc_get_time_tm(&tm);
+    time_t t_sys = time(0);
+    time_t t_err = t_sys - t_rtc;
+
+    /* Treat off by couple of seconds as non-error */
+    if( abs(t_err) <= 2 )
+        t_err = 0;
+
+// QUARANTINE     char tmp[64];
+// QUARANTINE     dsme_log(LOG_WARNING, PFIX"rtc at %s", t_repr(t_rtc, tmp, sizeof tmp));
+// QUARANTINE     dsme_log(LOG_WARNING, PFIX"sys at %s", t_repr(t_sys, tmp, sizeof tmp));
+// QUARANTINE     dsme_log(LOG_WARNING, PFIX"error %+ld", (long)t_err);
+
+    if( rtc_get_error() != t_err )
+        rtc_set_error(t_err);
+
+    return t_err;
+}
 
 /* ------------------------------------------------------------------------- *
  * RTC management functionality
@@ -906,14 +1026,6 @@ cleanup:
     return result;
 }
 
-/** Flag for: RTC_SET_TIME has worked at least once
- *
- * RTC time of day is not used for syncing system time
- * unless this gets set to true.
- *
- * FIXME: All of this is just a quick hack ...
- */
-static bool rtc_set_time_works = false;
 
 /** Set rtc time from struct rtc_time
  *
@@ -935,9 +1047,11 @@ static bool rtc_set_time_raw(struct rtc_time *tod)
 
     rtc_log_time(LOG_INFO, PFIX"set rtc time to: ", tod);
 
-    rtc_set_time_works = result = true;
+    result = true;
 
 cleanup:
+
+    rtc_set_time_works = result;
 
     return result;
 }
@@ -1178,6 +1292,9 @@ static void rtc_set_alarm_powerup(void)
 /** Flag for: update system time on rtc interrupt */
 static bool rtc_to_system_time = false;
 
+/** Counter for: update rtc error on rtc interrupt */
+static int rtc_error_update_count = 0;
+
 /** Handle input from /dev/rtc
  *
  * @return true on success, or false in case of errors
@@ -1210,9 +1327,6 @@ static bool rtc_handle_input(void)
     if( rtc_to_system_time ) {
 	rtc_to_system_time = false;
 
-	if( ioctl(rtc_fd, RTC_UIE_OFF, 0) == -1 )
-	    dsme_log(LOG_WARNING, PFIX"failed to disable update interrupts");
-
 	struct timeval tv;
 
 	if( !rtc_set_time_works )
@@ -1223,6 +1337,19 @@ static bool rtc_handle_input(void)
 	    dsme_log(LOG_WARNING, PFIX"failed to set system time");
 	else
 	    dsme_log(LOG_INFO, PFIX"system time set from rtc");
+
+	/* Keep the update interrupts active for few more rounds to
+	 * make sure we get stable rtc error statistics */
+	rtc_error_update_count = 5;
+    }
+
+    if( rtc_error_update_count > 0 ) {
+	rtc_update_error();
+
+	if( --rtc_error_update_count == 0 ) {
+	    if( ioctl(rtc_fd, RTC_UIE_OFF, 0) == -1 )
+		dsme_log(LOG_WARNING, PFIX"failed to disable update interrupts");
+	}
     }
 
     /* acquire wakelock that is passed to mce via ipc */
@@ -1276,28 +1403,6 @@ static bool rtc_attach(void)
 
     /* deal with obviously wrong rtc time values */
     systemtime_init();
-
-    /* 1st: Set system time from rtc. This should bring the two
-     *      clocks within one second from each other */
-    struct timeval tv;
-    if( !rtc_set_time_works ) {
-	dsme_log(LOG_WARNING, PFIX"rtc not writable; not using it as system time source");
-    }
-    else if( !rtc_get_time_tv(&tv) )
-	dsme_log(LOG_WARNING, PFIX"failed to read rtc time");
-    else if( settimeofday(&tv, 0) == -1 )
-	dsme_log(LOG_WARNING, PFIX"failed to set system time");
-    else
-	dsme_log(LOG_INFO, PFIX"system time set from rtc");
-
-    /* 2nd: Use rtc update interrupts to bring system time
-     *      closer to rtc time */
-    if( ioctl(rtc_fd, RTC_UIE_ON, 0) == -1 ) {
-	dsme_log(LOG_WARNING, PFIX"failed to enable update interrupts");
-    }
-    else {
-	rtc_to_system_time = true;
-    }
 
 cleanup:
 
@@ -1925,6 +2030,8 @@ static void clientlist_rethink_rtc_wakeup(const struct timeval *now)
 	sleeptime = 0;
 
     rtc_set_alarm_after(sleeptime);
+
+    rtc_update_error();
 }
 
 /** Timer callback function for waking up clients between heartbeats
@@ -2864,31 +2971,64 @@ static void mintime_store(void)
 
 static void systemtime_init(void)
 {
+    char tmp[32];
     struct tm tm;
+
+    /* Get current state */
+
     time_t t_sys = time(0);
     time_t t_min = mintime_fetch();
     time_t t_rtc = rtc_get_time_tm(&tm);
 
+    dsme_log(LOG_WARNING, PFIX"min at %s", t_repr(t_min, tmp, sizeof tmp));
+    dsme_log(LOG_WARNING, PFIX"rtc at %s", t_repr(t_rtc, tmp, sizeof tmp));
+    dsme_log(LOG_WARNING, PFIX"sys at %s", t_repr(t_sys, tmp, sizeof tmp));
+
+    /* Take possible cached rtc error into account */
+
+    time_t t_err = rtc_get_error();
+
+    t_rtc += t_err;
+
+    if( t_min < t_rtc )
+        t_min = t_rtc;
+
+    /* Adjust rtc time if it is less that expected minimum */
+
     if( t_rtc < t_min ) {
-	char tmp[32];
-	dsme_log(LOG_WARNING, PFIX"rtc at %s", t_repr(t_rtc, tmp, sizeof tmp));
-	dsme_log(LOG_WARNING, PFIX"set to %s", t_repr(t_min, tmp, sizeof tmp));
-	rtc_set_time_t(t_min);
+        dsme_log(LOG_WARNING, PFIX"rtc to %s", t_repr(t_min, tmp, sizeof tmp));
+        rtc_set_time_t(t_min);
+        t_rtc = t_min;
     }
 
-    if( t_sys < t_min ) {
-	char tmp[32];
-	dsme_log(LOG_WARNING, PFIX"sys at %s", t_repr(t_sys, tmp, sizeof tmp));
-	dsme_log(LOG_WARNING, PFIX"set to %s", t_repr(t_min, tmp, sizeof tmp));
-	struct timeval tv = { .tv_sec = t_min, .tv_usec = 0 };
-	if( settimeofday(&tv, 0) == -1 )
-	    dsme_log(LOG_WARNING, PFIX"failed to set system time");
+    /* 1st: Set system time from rtc. This should bring the two
+     *      clocks within one second from each other */
+
+    if( t_err == 0 || t_sys < t_rtc ) {
+        dsme_log(LOG_WARNING, PFIX"sys to %s", t_repr(t_rtc, tmp, sizeof tmp));
+        struct timeval tv = { .tv_sec = t_rtc, .tv_usec = 0 };
+        if( settimeofday(&tv, 0) == -1 )
+            dsme_log(LOG_WARNING, PFIX"failed to set system time");
     }
+
+    /* 2nd: Use rtc update interrupts to bring system time
+     *      closer to rtc time */
+    if( ioctl(rtc_fd, RTC_UIE_ON, 0) == -1 ) {
+        dsme_log(LOG_WARNING, PFIX"failed to enable update interrupts");
+    }
+    else {
+        rtc_to_system_time = true;
+    }
+
+    /* Update cached rtc error value; this will be repeated on
+     * rtc interrupts and when rtc alarm needs re-evaluation */
+    rtc_update_error();
 }
 
 static void systemtime_quit(void)
 {
     mintime_store();
+    rtc_update_error();
 }
 
 /* ------------------------------------------------------------------------- *
@@ -2970,15 +3110,15 @@ void module_fini(void)
 	    dsme_log(LOG_CRIT, PFIX"RTC updated to system time");
     }
 
+    /* save last-known-system-time */
+    systemtime_quit();
+
     /* set wakeup alarm before closing the rtc */
     rtc_set_alarm_powerup();
     rtc_detach();
 
     /* close android alarm device */
     android_alarm_quit();
-
-    /* save last-known-system-time */
-    systemtime_quit();
 
     /* cleanup rest of what is in the epoll set */
     listenfd_quit();
