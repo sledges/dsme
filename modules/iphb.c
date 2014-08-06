@@ -906,6 +906,15 @@ cleanup:
     return result;
 }
 
+/** Flag for: RTC_SET_TIME has worked at least once
+ *
+ * RTC time of day is not used for syncing system time
+ * unless this gets set to true.
+ *
+ * FIXME: All of this is just a quick hack ...
+ */
+static bool rtc_set_time_works = false;
+
 /** Set rtc time from struct rtc_time
  *
  * @param tod broken down rtc time
@@ -926,7 +935,7 @@ static bool rtc_set_time_raw(struct rtc_time *tod)
 
     rtc_log_time(LOG_INFO, PFIX"set rtc time to: ", tod);
 
-    result = true;
+    rtc_set_time_works = result = true;
 
 cleanup:
 
@@ -1206,7 +1215,9 @@ static bool rtc_handle_input(void)
 
 	struct timeval tv;
 
-	if( !rtc_get_time_tv(&tv) )
+	if( !rtc_set_time_works )
+	    dsme_log(LOG_WARNING, PFIX"rtc not writable; not using it as system time source");
+	else if( !rtc_get_time_tv(&tv) )
 	    dsme_log(LOG_WARNING, PFIX"failed to read rtc time");
 	else if( settimeofday(&tv, 0) == -1 )
 	    dsme_log(LOG_WARNING, PFIX"failed to set system time");
@@ -1269,7 +1280,10 @@ static bool rtc_attach(void)
     /* 1st: Set system time from rtc. This should bring the two
      *      clocks within one second from each other */
     struct timeval tv;
-    if( !rtc_get_time_tv(&tv) )
+    if( !rtc_set_time_works ) {
+	dsme_log(LOG_WARNING, PFIX"rtc not writable; not using it as system time source");
+    }
+    else if( !rtc_get_time_tv(&tv) )
 	dsme_log(LOG_WARNING, PFIX"failed to read rtc time");
     else if( settimeofday(&tv, 0) == -1 )
 	dsme_log(LOG_WARNING, PFIX"failed to set system time");
@@ -2851,6 +2865,7 @@ static void mintime_store(void)
 static void systemtime_init(void)
 {
     struct tm tm;
+    time_t t_sys = time(0);
     time_t t_min = mintime_fetch();
     time_t t_rtc = rtc_get_time_tm(&tm);
 
@@ -2859,6 +2874,15 @@ static void systemtime_init(void)
 	dsme_log(LOG_WARNING, PFIX"rtc at %s", t_repr(t_rtc, tmp, sizeof tmp));
 	dsme_log(LOG_WARNING, PFIX"set to %s", t_repr(t_min, tmp, sizeof tmp));
 	rtc_set_time_t(t_min);
+    }
+
+    if( t_sys < t_min ) {
+	char tmp[32];
+	dsme_log(LOG_WARNING, PFIX"sys at %s", t_repr(t_sys, tmp, sizeof tmp));
+	dsme_log(LOG_WARNING, PFIX"set to %s", t_repr(t_min, tmp, sizeof tmp));
+	struct timeval tv = { .tv_sec = t_min, .tv_usec = 0 };
+	if( settimeofday(&tv, 0) == -1 )
+	    dsme_log(LOG_WARNING, PFIX"failed to set system time");
     }
 }
 
