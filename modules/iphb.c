@@ -765,29 +765,36 @@ static void android_alarm_clear(void)
 cleanup:
     return;
 }
+
 /* ------------------------------------------------------------------------- *
- * circumventing RTC not working as expected
+ * circumventing read only RTC time of day
  * ------------------------------------------------------------------------- */
 
-/** Flag for: assume RTC_SET_TIME works
+static time_t rtc_get_time_tm(struct tm *tm);
+
+/** Flag for: RTC_SET_TIME does not work
  *
- * RTC time of day is not used for syncing system time
- * while this is set to false.
+ * If true, rtc time is not used for updating the system time.
  *
- * FIXME: All of this is just a quick hack ...
+ * Probed after rtc device is opened.
  */
-static bool rtc_set_time_works = true;
+static bool deltatime_is_needed = false;
+
+/** Counter for: update delta value on rtc interrupt */
+static int deltatime_updates_todo = 0;
 
 /** Delta between rtc and system time
  *
  * Access only via rtc_get/set/update_error() functions
  */
-static time_t rtc_error = 0;
+static time_t deltatime_cached = 0;
 
-/** Persistent storage for rtc_error */
-#define RTC_ERROR_FILE "/var/tmp/rtc-delta"
+/** Persistent storage path for deltatime_cached */
+#define DELTATIME_CACHE_FILE "/var/tmp/delta-time"
 
-static time_t rtc_get_error(void)
+/** Read and cache delta value stored in DELTATIME_CACHE_FILE
+ */
+static time_t deltatime_get(void)
 {
     static bool load_attempted = false;
 
@@ -798,56 +805,53 @@ static time_t rtc_get_error(void)
 
     load_attempted = true;
 
-    if( (fd = open(RTC_ERROR_FILE, O_RDONLY)) == -1 ) {
+    if( (fd = open(DELTATIME_CACHE_FILE, O_RDONLY)) == -1 ) {
         if( errno != ENOENT )
-            dsme_log(LOG_ERR, PFIX"%s: %s: %m", RTC_ERROR_FILE, "open");
+            dsme_log(LOG_ERR, PFIX"%s: %s: %m", DELTATIME_CACHE_FILE, "open");
         goto cleanup;
     }
 
     char tmp[32];
     int len = read(fd, tmp, sizeof tmp - 1);
     if( len < 0 ) {
-        dsme_log(LOG_ERR, PFIX"%s: %s: %m", RTC_ERROR_FILE, "read");
+        dsme_log(LOG_ERR, PFIX"%s: %s: %m", DELTATIME_CACHE_FILE, "read");
         goto cleanup;
     }
 
     tmp[len] = 0;
 
-    rtc_error = strtol(tmp, 0, 0);
-    rtc_set_time_works = (rtc_error == 0);
+    deltatime_cached = strtol(tmp, 0, 0);
+
+    dsme_log(LOG_WARNING, PFIX"rtc delta is %ld", (long)deltatime_cached);
 
 cleanup:
 
     if( fd != -1 ) close(fd);
 
-    dsme_log(LOG_ERR, PFIX"rtc error is %ld", (long)rtc_error);
-
-    return rtc_error;
+    return deltatime_cached;
 }
 
-static void rtc_set_error(time_t t_err)
+/** Store delta value in to DELTATIME_CACHE_FILE
+ */
+static void deltatime_set(time_t delta)
 {
     int fd = -1;
 
-    if( abs(rtc_error - t_err) <= 2 )
-        goto cleanup;
+    deltatime_cached = delta;
 
-    rtc_error = t_err;
+    dsme_log(LOG_WARNING, PFIX"rtc delta to %ld", (long)deltatime_cached);
 
-    rtc_set_time_works = (rtc_error == 0);
-
-    dsme_log(LOG_ERR, PFIX"rtc error to %ld", (long)rtc_error);
-
-    if( (fd = open(RTC_ERROR_FILE, O_WRONLY|O_CREAT|O_TRUNC, 0644)) == -1 ) {
-        dsme_log(LOG_ERR, PFIX"%s: %s: %m", RTC_ERROR_FILE, "open");
+    fd = open(DELTATIME_CACHE_FILE, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    if( fd == -1 ) {
+        dsme_log(LOG_ERR, PFIX"%s: %s: %m", DELTATIME_CACHE_FILE, "open");
         goto cleanup;
     }
 
     char tmp[32];
-    int len = snprintf(tmp, sizeof tmp, "%ld\n", (long)t_err);
+    int len = snprintf(tmp, sizeof tmp, "%ld\n", (long)delta);
 
     if( len > 0 && write(fd, tmp, len) == -1 ) {
-        dsme_log(LOG_ERR, PFIX"%s: %s: %m", RTC_ERROR_FILE, "write");
+        dsme_log(LOG_ERR, PFIX"%s: %s: %m", DELTATIME_CACHE_FILE, "write");
         goto cleanup;
     }
 
@@ -856,34 +860,33 @@ cleanup:
     if( fd != -1 ) close(fd);
 }
 
-static time_t rtc_get_time_tm(struct tm *tm);
-
-static time_t rtc_update_error(void)
+/** Re-calculate delta value and update DELTATIME_CACHE_FILE if changed
+ */
+static void deltatime_update(void)
 {
     struct tm tm;
 
-    if( rtc_fd == -1 ) {
-        // FIXME: ensure that this is not called while rtc dev is not open
-        return 0;
-    }
+    /* Not applicaple if the rtc device is not open */
+    if( rtc_fd == -1 )
+        goto cleanup;
 
+    /* Calculate system time - rtc time delta */
     time_t t_rtc = rtc_get_time_tm(&tm);
     time_t t_sys = time(0);
-    time_t t_err = t_sys - t_rtc;
+    time_t delta = t_sys - t_rtc;
 
-    /* Treat off by couple of seconds as non-error */
-    if( abs(t_err) <= 2 )
-        t_err = 0;
+    /* Treat off-by-couple-of-seconds as non-error */
+    if( abs(delta) <= 2 )
+        delta = 0;
 
-// QUARANTINE     char tmp[64];
-// QUARANTINE     dsme_log(LOG_WARNING, PFIX"rtc at %s", t_repr(t_rtc, tmp, sizeof tmp));
-// QUARANTINE     dsme_log(LOG_WARNING, PFIX"sys at %s", t_repr(t_sys, tmp, sizeof tmp));
-// QUARANTINE     dsme_log(LOG_WARNING, PFIX"error %+ld", (long)t_err);
+    /* We expect to see some jitter in the calculated delta values.
+     * Ignore minor values to avoid excessive filesystem updates. */
+    if( abs(deltatime_get() - delta) > 2 )
+        deltatime_set(delta);
 
-    if( rtc_get_error() != t_err )
-        rtc_set_error(t_err);
+cleanup:
 
-    return t_err;
+    return;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -1026,7 +1029,6 @@ cleanup:
     return result;
 }
 
-
 /** Set rtc time from struct rtc_time
  *
  * @param tod broken down rtc time
@@ -1050,8 +1052,6 @@ static bool rtc_set_time_raw(struct rtc_time *tod)
     result = true;
 
 cleanup:
-
-    rtc_set_time_works = result;
 
     return result;
 }
@@ -1292,9 +1292,6 @@ static void rtc_set_alarm_powerup(void)
 /** Flag for: update system time on rtc interrupt */
 static bool rtc_to_system_time = false;
 
-/** Counter for: update rtc error on rtc interrupt */
-static int rtc_error_update_count = 0;
-
 /** Handle input from /dev/rtc
  *
  * @return true on success, or false in case of errors
@@ -1323,13 +1320,15 @@ static bool rtc_handle_input(void)
 	goto cleanup;
     }
 
-    /* set system time and disable update interrupts */
+    /* rtc time - which has 1 second accuracy - just changed -> update
+     * higher resolution system time with assumption that any fraction
+     * over full seconds is close to zero at this point */
     if( rtc_to_system_time ) {
 	rtc_to_system_time = false;
 
 	struct timeval tv;
 
-	if( !rtc_set_time_works )
+	if( deltatime_is_needed )
 	    dsme_log(LOG_WARNING, PFIX"rtc not writable; not using it as system time source");
 	else if( !rtc_get_time_tv(&tv) )
 	    dsme_log(LOG_WARNING, PFIX"failed to read rtc time");
@@ -1339,14 +1338,16 @@ static bool rtc_handle_input(void)
 	    dsme_log(LOG_INFO, PFIX"system time set from rtc");
 
 	/* Keep the update interrupts active for few more rounds to
-	 * make sure we get stable rtc error statistics */
-	rtc_error_update_count = 5;
+	 * make sure we get stable rtc delta statistics */
+	deltatime_updates_todo = 5;
     }
 
-    if( rtc_error_update_count > 0 ) {
-	rtc_update_error();
+    /* Update sys_time vs rtc_time delta statistics a few times, then
+     * disable the rtc update interrupts */
+    if( deltatime_updates_todo > 0 ) {
+	deltatime_update();
 
-	if( --rtc_error_update_count == 0 ) {
+	if( --deltatime_updates_todo == 0 ) {
 	    if( ioctl(rtc_fd, RTC_UIE_OFF, 0) == -1 )
 		dsme_log(LOG_WARNING, PFIX"failed to disable update interrupts");
 	}
@@ -2031,7 +2032,7 @@ static void clientlist_rethink_rtc_wakeup(const struct timeval *now)
 
     rtc_set_alarm_after(sleeptime);
 
-    rtc_update_error();
+    deltatime_update();
 }
 
 /** Timer callback function for waking up clients between heartbeats
@@ -2980,39 +2981,53 @@ static void systemtime_init(void)
     time_t t_min = mintime_fetch();
     time_t t_rtc = rtc_get_time_tm(&tm);
 
-    dsme_log(LOG_WARNING, PFIX"min at %s", t_repr(t_min, tmp, sizeof tmp));
-    dsme_log(LOG_WARNING, PFIX"rtc at %s", t_repr(t_rtc, tmp, sizeof tmp));
-    dsme_log(LOG_WARNING, PFIX"sys at %s", t_repr(t_sys, tmp, sizeof tmp));
+    dsme_log(LOG_NOTICE, PFIX"min at %s", t_repr(t_min, tmp, sizeof tmp));
+    dsme_log(LOG_NOTICE, PFIX"rtc at %s", t_repr(t_rtc, tmp, sizeof tmp));
+    dsme_log(LOG_NOTICE, PFIX"sys at %s", t_repr(t_sys, tmp, sizeof tmp));
 
-    /* Take possible cached rtc error into account */
+    /* Take possible cached sys-time vs rtc-time delta into account */
 
-    time_t t_err = rtc_get_error();
+    time_t delta = deltatime_get();
 
-    t_rtc += t_err;
+    t_rtc += delta;
 
     if( t_min < t_rtc )
         t_min = t_rtc;
 
-    /* Adjust rtc time if it is less that expected minimum */
+    /* Adjust rtc time if it is currently below expected minimum, or if
+     * there is a reason to believe that RTC_SET_TIME might not work */
 
-    if( t_rtc < t_min ) {
+    time_t t_set = -1;
+
+    if( t_rtc < t_min  )
+        t_set = t_min;
+    else if( delta != 0 )
+        t_set = t_rtc;
+
+    if( t_set != -1 ) {
         dsme_log(LOG_WARNING, PFIX"rtc to %s", t_repr(t_min, tmp, sizeof tmp));
-        rtc_set_time_t(t_min);
-        t_rtc = t_min;
+        if( !rtc_set_time_t(t_min) )
+            deltatime_is_needed = true;
+        t_rtc = t_set;
     }
 
-    /* 1st: Set system time from rtc. This should bring the two
-     *      clocks within one second from each other */
+    /* Adjust system time if rtc time can be assumed to be correct or
+     * it is ahead of the system time */
 
-    if( t_err == 0 || t_sys < t_rtc ) {
+    if( delta == 0 || t_sys < t_rtc ) {
         dsme_log(LOG_WARNING, PFIX"sys to %s", t_repr(t_rtc, tmp, sizeof tmp));
         struct timeval tv = { .tv_sec = t_rtc, .tv_usec = 0 };
         if( settimeofday(&tv, 0) == -1 )
             dsme_log(LOG_WARNING, PFIX"failed to set system time");
+
+        /* system time should now be within 1 second from rtc time */
     }
 
-    /* 2nd: Use rtc update interrupts to bring system time
-     *      closer to rtc time */
+    /* Enable RTC update interrupts; the 1st one is used to bring system
+     * time closer in sync with rtc time and few following ones to update
+     * sys-time vs rtc-time delta.
+     */
+
     if( ioctl(rtc_fd, RTC_UIE_ON, 0) == -1 ) {
         dsme_log(LOG_WARNING, PFIX"failed to enable update interrupts");
     }
@@ -3020,15 +3035,17 @@ static void systemtime_init(void)
         rtc_to_system_time = true;
     }
 
-    /* Update cached rtc error value; this will be repeated on
-     * rtc interrupts and when rtc alarm needs re-evaluation */
-    rtc_update_error();
+    /* Update cached rtc delta value; this will be repeated when
+     * handling rtc interrupts, programming rtc alarms and
+     * just before dsme exits */
+
+    deltatime_update();
 }
 
 static void systemtime_quit(void)
 {
     mintime_store();
-    rtc_update_error();
+    deltatime_update();
 }
 
 /* ------------------------------------------------------------------------- *
