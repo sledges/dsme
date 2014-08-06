@@ -870,10 +870,14 @@ static void deltatime_update(void)
     if( rtc_fd == -1 )
         goto cleanup;
 
-    /* Calculate system time - rtc time delta */
-    time_t t_rtc = rtc_get_time_tm(&tm);
-    time_t t_sys = time(0);
-    time_t delta = t_sys - t_rtc;
+    time_t delta = 0;
+
+    if( deltatime_is_needed ) {
+        /* Calculate system time - rtc time delta */
+        time_t t_rtc = rtc_get_time_tm(&tm);
+        time_t t_sys = time(0);
+        delta = t_sys - t_rtc;
+    }
 
     /* Treat off-by-couple-of-seconds as non-error */
     if( abs(delta) <= 2 )
@@ -2989,26 +2993,29 @@ static void systemtime_init(void)
 
     time_t delta = deltatime_get();
 
+
+    if( delta != 0 ) {
+	/* If we have cached delta time; before accepting it
+	 * check if RTC_SET_TIME actually fails */
+        dsme_log(LOG_WARNING, PFIX"rtc to %s", t_repr(t_rtc, tmp, sizeof tmp));
+        if( !rtc_set_time_t(t_rtc) )
+            deltatime_is_needed = true;
+	else
+	    delta = 0;
+    }
+
     t_rtc += delta;
 
     if( t_min < t_rtc )
         t_min = t_rtc;
 
-    /* Adjust rtc time if it is currently below expected minimum, or if
-     * there is a reason to believe that RTC_SET_TIME might not work */
+    /* Adjust rtc time if it is currently below expected minimum */
 
-    time_t t_set = -1;
-
-    if( t_rtc < t_min  )
-        t_set = t_min;
-    else if( delta != 0 )
-        t_set = t_rtc;
-
-    if( t_set != -1 ) {
-        dsme_log(LOG_WARNING, PFIX"rtc to %s", t_repr(t_min, tmp, sizeof tmp));
-        if( !rtc_set_time_t(t_min) )
+    if( t_rtc < t_min ) {
+        t_rtc = t_min;
+        dsme_log(LOG_WARNING, PFIX"rtc to %s", t_repr(t_rtc, tmp, sizeof tmp));
+        if( !rtc_set_time_t(t_rtc) )
             deltatime_is_needed = true;
-        t_rtc = t_set;
     }
 
     /* Adjust system time if rtc time can be assumed to be correct or
